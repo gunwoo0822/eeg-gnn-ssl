@@ -276,26 +276,110 @@ def _load_signal_from_h5(h5_file, rec_key, signal_key):
     return ds
 
 
+_SEIZURE_DESCRIPTIONS = {"sz", "seizure", "seiz", "ictal"}
+
+
+def _parse_annotation_node(node, fs):
+    """
+    Parse an HDF5 node that contains seizure annotations.
+
+    Handles two formats:
+      1. Dataset (M, 2): each row is (start_sec_or_sample, end_sec_or_sample)
+      2. Group with sub-datasets onset / duration / description:
+             onset       – (M,) seconds
+             duration    – (M,) seconds
+             description – (M,) bytes/str, keep where value in SEIZURE_DESCRIPTIONS
+
+    Returns list of (start_sample, end_sample) or [] if nothing found.
+    """
+    import h5py
+
+    if isinstance(node, h5py.Dataset):
+        arr = node[()]
+        if arr.ndim == 0 or arr.size == 0:
+            return []
+        arr = np.atleast_2d(arr)
+        if arr.max() < 10000:
+            arr = (arr * fs).astype(int)
+        return [(int(r[0]), int(r[1])) for r in arr]
+
+    if isinstance(node, h5py.Group):
+        if "onset" not in node or "duration" not in node:
+            return []
+        onsets    = node["onset"][()]
+        durations = node["duration"][()]
+
+        # Filter by description if present
+        if "description" in node:
+            raw_desc = node["description"][()]
+            keep = []
+            for i, d in enumerate(raw_desc):
+                if isinstance(d, (bytes, np.bytes_)):
+                    d = d.decode("utf-8", errors="replace")
+                if str(d).strip().lower() in _SEIZURE_DESCRIPTIONS:
+                    keep.append(i)
+            if not keep:
+                return []
+            onsets    = onsets[keep]
+            durations = durations[keep]
+
+        intervals = []
+        for onset, dur in zip(onsets, durations):
+            start = int(float(onset) * fs)
+            end   = int((float(onset) + float(dur)) * fs)
+            if end > start:
+                intervals.append((start, end))
+        return intervals
+
+    return []
+
+
 def _load_seizure_times_from_h5(h5_file, rec_key, sz_key, fs):
     """
     Try to read seizure intervals from an open h5py.File.
 
+    Checks sz_key first; if that is None or fails, falls back to an
+    'annotations' group at the recording level (or top level).
+
     Returns list of (start_sample, end_sample) or [] if none found.
     """
-    if sz_key is None:
-        return []
+    import h5py
+
+    def _try_key(parent, key):
+        try:
+            node = parent[key]
+            return _parse_annotation_node(node, fs)
+        except Exception:
+            return None
+
+    # Determine the parent group (recording level or top level)
     try:
-        node = h5_file[rec_key][sz_key] if rec_key else h5_file[sz_key]
-        arr = node[()]
-        if arr.ndim == 0 or arr.size == 0:
-            return []
-        arr = np.atleast_2d(arr)    # (M, 2) – seconds or samples
-        # Heuristic: if values look like seconds (< 10000) convert to samples
-        if arr.max() < 10000:
-            arr = (arr * fs).astype(int)
-        return [(int(r[0]), int(r[1])) for r in arr]
+        parent = h5_file[rec_key] if rec_key else h5_file
     except Exception:
         return []
+
+    # 1. Try the explicitly detected sz_key
+    if sz_key is not None:
+        result = _try_key(parent, sz_key)
+        if result is not None:
+            return result
+
+    # 2. Fallback: look for an 'annotations' group / dataset
+    for fallback in ("annotations", "seizure_times", "seizures"):
+        if fallback in parent:
+            result = _try_key(parent, fallback)
+            if result is not None:
+                return result
+
+    # 3. Last resort: check at the top-level HDF5 root if rec_key was set
+    if rec_key:
+        for fallback in ("annotations", "seizure_times", "seizures"):
+            if fallback in h5_file:
+                result = _try_key(h5_file, fallback)
+                if result is not None:
+                    return result
+
+    return []
 
 
 # ---------------------------------------------------------------------------

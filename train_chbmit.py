@@ -133,6 +133,9 @@ def get_args():
                         choices=["auroc", "F1", "acc", "loss"],
                         default="auroc",
                         help="Metric used to select best checkpoint.")
+    parser.add_argument("--pos_weight", type=float, default=None,
+                        help="Positive class weight for BCEWithLogitsLoss. "
+                             "If None, auto-computed from training set ratio.")
 
     args = parser.parse_args()
 
@@ -155,8 +158,9 @@ def get_args():
 # Evaluate
 # ---------------------------------------------------------------------------
 
-def evaluate(model, dataloader, device, args, debug_shapes=False):
-    """Run model on dataloader; return metrics dict."""
+def evaluate(model, dataloader, device, args,
+             debug_shapes=False, threshold=0.5, return_probs=False):
+    """Run model on dataloader; return metrics dict (and optionally raw arrays)."""
     model.eval()
     loss_fn = nn.BCEWithLogitsLoss().to(device)
 
@@ -186,21 +190,60 @@ def evaluate(model, dataloader, device, args, debug_shapes=False):
 
     y_prob_all = np.concatenate(y_prob_all)
     y_true_all = np.concatenate(y_true_all)
-    y_pred_all = (y_prob_all >= 0.5).astype(int)
+    y_pred_all = (y_prob_all >= threshold).astype(int)
 
     scores, _, _ = utils.eval_dict(
         y_pred=y_pred_all, y=y_true_all, y_prob=y_prob_all, average="binary")
     scores["loss"] = total_loss / max(n_batches, 1)
+    scores["threshold"] = threshold
+
+    if return_probs:
+        return scores, y_true_all, y_prob_all
     return scores
+
+
+def sweep_threshold(y_true, y_prob, thresholds=None):
+    """
+    Sweep classification thresholds and return best by F1.
+
+    Returns (best_threshold, best_scores, all_rows) where all_rows is a list
+    of dicts with keys threshold/F1/precision/recall/acc.
+    """
+    from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+
+    if thresholds is None:
+        thresholds = np.linspace(0.01, 0.99, 99)
+
+    best_thresh = 0.5
+    best_f1     = -1.0
+    best_scores = {}
+    all_rows    = []
+
+    for thr in thresholds:
+        y_pred = (y_prob >= thr).astype(int)
+        f1   = f1_score(y_true, y_pred, average="binary", zero_division=0)
+        prec = precision_score(y_true, y_pred, average="binary", zero_division=0)
+        rec  = recall_score(y_true, y_pred, average="binary", zero_division=0)
+        acc  = accuracy_score(y_true, y_pred)
+        row  = dict(threshold=thr, F1=f1, precision=prec, recall=rec, acc=acc)
+        all_rows.append(row)
+        if f1 > best_f1:
+            best_f1     = f1
+            best_thresh = thr
+            best_scores = row
+
+    return best_thresh, best_scores, all_rows
 
 
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
 
-def train(model, dataloaders, args, device, save_dir):
+def train(model, dataloaders, args, device, save_dir, pos_weight=None):
     """Main training loop with early stopping."""
-    loss_fn   = nn.BCEWithLogitsLoss().to(device)
+    pw      = torch.tensor([pos_weight], dtype=torch.float32).to(device) \
+              if pos_weight is not None else None
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw).to(device)
     optimizer = optim.Adam(model.parameters(),
                            lr=args.lr_init, weight_decay=args.l2_wd)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs)
@@ -353,6 +396,19 @@ def main():
         f"filter_type={args.filter_type}"
     )
 
+    # ── Class imbalance / pos_weight ─────────────────────────────────────
+    targets  = train_ds.targets()
+    n_pos    = int(sum(targets))
+    n_neg    = len(targets) - n_pos
+    auto_pw  = n_neg / max(n_pos, 1)
+    pos_weight = args.pos_weight if args.pos_weight is not None else auto_pw
+    log.info(
+        f"Train set: n_pos={n_pos}, n_neg={n_neg}, "
+        f"seizure_ratio={n_pos/max(len(targets),1):.4f}, "
+        f"pos_weight={pos_weight:.2f}"
+        + (" (manual)" if args.pos_weight is not None else " (auto)")
+    )
+
     # ── Model ────────────────────────────────────────────────────────────
     model = DCRNNModel_classification(
         args=args, num_classes=args.num_classes, device=device)
@@ -366,18 +422,44 @@ def main():
 
     # ── Train ─────────────────────────────────────────────────────────────
     if args.do_train:
-        train(model, dataloaders, args, device, save_dir)
+        train(model, dataloaders, args, device, save_dir,
+              pos_weight=pos_weight)
         best_path = os.path.join(save_dir, "best.pth.tar")
         if os.path.exists(best_path):
             model = utils.load_model_checkpoint(best_path, model)
             model = model.to(device)
             log.info("Loaded best checkpoint for final evaluation.")
 
+    # ── Threshold sweep on dev set ────────────────────────────────────────
+    log.info("Running threshold sweep on dev set …")
+    dev_scores_05, dev_true, dev_prob = evaluate(
+        model, dataloaders["dev"], device, args,
+        threshold=0.5, return_probs=True)
+    best_thresh, best_dev_scores, sweep_rows = sweep_threshold(dev_true, dev_prob)
+    log.info(f"Best threshold (dev F1): {best_thresh:.2f}  "
+             f"F1={best_dev_scores['F1']:.4f}  "
+             f"precision={best_dev_scores['precision']:.4f}  "
+             f"recall={best_dev_scores['recall']:.4f}")
+
     # ── Final evaluation ──────────────────────────────────────────────────
     for split in ["dev", "test"]:
-        scores     = evaluate(model, dataloaders[split], device, args)
-        scores_str = ", ".join(f"{k}={v:.4f}" for k, v in scores.items())
-        log.info(f"[{split.upper()}] {scores_str}")
+        if split == "dev":
+            scores_05  = dev_scores_05
+            scores_bt, _, _ = evaluate(
+                model, dataloaders[split], device, args,
+                threshold=best_thresh, return_probs=True)
+        else:
+            scores_05, _, _ = evaluate(
+                model, dataloaders[split], device, args,
+                threshold=0.5, return_probs=True)
+            scores_bt, _, _ = evaluate(
+                model, dataloaders[split], device, args,
+                threshold=best_thresh, return_probs=True)
+
+        log.info(f"[{split.upper()}] threshold=0.50  " +
+                 ", ".join(f"{k}={v:.4f}" for k, v in scores_05.items()))
+        log.info(f"[{split.upper()}] threshold={best_thresh:.2f}  " +
+                 ", ".join(f"{k}={v:.4f}" for k, v in scores_bt.items()))
 
 
 if __name__ == "__main__":
