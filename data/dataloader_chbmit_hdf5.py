@@ -63,6 +63,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
+from scipy.signal import resample as sp_resample
 from torch.utils.data import Dataset, DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -583,23 +584,38 @@ def _build_index(
 # ---------------------------------------------------------------------------
 
 def compute_scaler_streaming(train_index, signal_key, win_samples,
-                              step_samples, num_nodes, fmt):
+                              step_samples, num_nodes, fmt,
+                              orig_fs=256, target_fs=200, fft_features=100):
     """
-    Compute per-channel mean/std without loading the full dataset.
+    Compute per-channel mean/std of log-amplitude FFT features (paper §A).
 
-    Strategy:
-      - Collect unique (h5_path, rec_key) pairs from the training index.
-      - For each unique recording, load the full signal array (one at a time).
-      - Accumulate sum and sum-of-squares across all samples.
-      - Compute mean/std from accumulated statistics.
+    Strategy (raw formats):
+      - Collect unique (h5_path, rec_key) recordings from the training index.
+      - Load each full recording once, resample orig_fs→target_fs, compute FFT
+        features, accumulate two-pass statistics.
+      - Peak RAM ≈ one recording (C × T × 4 bytes ≈ 85 MB for a 1-hour file).
 
-    Peak RAM: ~max(recording_length) × C × 4 bytes (≈ 85 MB for a 1-hour file)
+    Scaler output shape: (1, C, 1) — per-channel scalar, broadcast over
+    (seq_len, C, fft_features) via StandardScaler.transform().
     """
-    log.info("[Scaler] Computing per-channel statistics (streaming)...")
+    log.info(
+        f"[Scaler] Computing per-channel FFT-feature statistics (streaming) "
+        f"orig_fs={orig_fs}→target_fs={target_fs}, fft_features={fft_features}…"
+    )
+
+    def _recording_to_fft(sig_raw):
+        """(C, T_orig) → (total_steps, C, M) FFT features."""
+        sig = _resample_signal(sig_raw.astype(np.float32), orig_fs, target_fs)
+        C, T_res = sig.shape
+        n_steps = T_res // target_fs
+        if n_steps == 0:
+            return None
+        sig = sig[:, :n_steps * target_fs]                      # trim tail
+        seg = sig.reshape(C, n_steps, target_fs).transpose(1, 0, 2)  # (n_steps,C,200)
+        return _apply_fft_features(seg, fft_features)            # (n_steps,C,M)
 
     if fmt == "windowed":
-        # For pre-windowed data, sample the first window from each file
-        # (full signal isn't available; use windows as-is)
+        # Pre-windowed: sample windows, resample, FFT
         n_sample = min(len(train_index), 10000)
         sample_idx = np.random.choice(len(train_index), n_sample, replace=False)
         chan_sum    = np.zeros(num_nodes, dtype=np.float64)
@@ -608,19 +624,22 @@ def compute_scaler_streaming(train_index, signal_key, win_samples,
         for i in sample_idx:
             entry = train_index[i]
             with h5py.File(entry.h5_path, "r") as f:
-                win = f[signal_key][entry.start].astype(np.float64)  # (C, T_win)
-                if win.shape[0] != num_nodes:
-                    win = win.T
-            chan_sum    += win.sum(axis=1)
-            chan_sq_sum += (win ** 2).sum(axis=1)
-            count       += win.shape[1]
-        mean = chan_sum / count
-        std  = np.sqrt(np.maximum(chan_sq_sum / count - mean ** 2, 1e-12))
+                raw = f[signal_key][entry.start].astype(np.float32)  # (C, T_win)
+                if raw.shape[0] != num_nodes:
+                    raw = raw.T
+            feats = _recording_to_fft(raw)   # (n_steps, C, M)
+            if feats is None:
+                continue
+            chan_sum    += feats.sum(axis=(0, 2))          # (C,)
+            chan_sq_sum += (feats ** 2).sum(axis=(0, 2))
+            count       += feats.shape[0] * feats.shape[2]
+        mean = chan_sum / max(count, 1)
+        std  = np.sqrt(np.maximum(chan_sq_sum / max(count, 1) - mean ** 2, 1e-12))
         std[std < 1e-6] = 1.0
         return (mean[np.newaxis, :, np.newaxis].astype(np.float32),
                 std[np.newaxis, :, np.newaxis].astype(np.float32))
 
-    # For raw data: collect unique recordings from train index
+    # Raw formats: collect unique recordings
     unique_recs = {}
     for entry in train_index:
         key = (entry.h5_path, entry.rec_key)
@@ -629,33 +648,39 @@ def compute_scaler_streaming(train_index, signal_key, win_samples,
     n_recs = len(unique_recs)
     log.info(f"[Scaler] {n_recs} unique recordings in training set.")
 
-    # Pass 1: accumulate sum
-    chan_sum = np.zeros(num_nodes, dtype=np.float64)
-    total_count = 0
+    # Pass 1: accumulate sum of FFT features
+    chan_sum  = np.zeros(num_nodes, dtype=np.float64)
+    total_cnt = 0
     for (h5_path, rec_key), _ in unique_recs.items():
         with h5py.File(h5_path, "r") as f:
-            ds = _load_signal_from_h5(f, rec_key, signal_key)
-            sig = ds[()].astype(np.float64)    # full recording, float64
-        if sig.shape[0] != num_nodes:
-            sig = sig.T
-        chan_sum    += sig.sum(axis=1)
-        total_count += sig.shape[1]
-        log.debug(f"[Scaler pass1] {Path(h5_path).name} rec={rec_key} "
-                  f"sig={sig.shape}")
+            ds  = _load_signal_from_h5(f, rec_key, signal_key)
+            raw = ds[()].astype(np.float32)
+        if raw.shape[0] != num_nodes:
+            raw = raw.T
+        feats = _recording_to_fft(raw)           # (n_steps, C, M) or None
+        if feats is None:
+            continue
+        chan_sum  += feats.sum(axis=(0, 2))      # sum over (steps, freq_bins)
+        total_cnt += feats.shape[0] * feats.shape[2]
+        log.debug(f"[Scaler pass1] {Path(h5_path).name} feats={feats.shape}")
 
-    mean = chan_sum / total_count
+    mean = chan_sum / max(total_cnt, 1)
 
-    # Pass 2: accumulate variance
+    # Pass 2: accumulate squared deviations
     chan_sq_diff = np.zeros(num_nodes, dtype=np.float64)
     for (h5_path, rec_key), _ in unique_recs.items():
         with h5py.File(h5_path, "r") as f:
-            ds = _load_signal_from_h5(f, rec_key, signal_key)
-            sig = ds[()].astype(np.float64)
-        if sig.shape[0] != num_nodes:
-            sig = sig.T
-        chan_sq_diff += ((sig - mean[:, np.newaxis]) ** 2).sum(axis=1)
+            ds  = _load_signal_from_h5(f, rec_key, signal_key)
+            raw = ds[()].astype(np.float32)
+        if raw.shape[0] != num_nodes:
+            raw = raw.T
+        feats = _recording_to_fft(raw)
+        if feats is None:
+            continue
+        diff = feats - mean[np.newaxis, :, np.newaxis]    # (n_steps,C,M)
+        chan_sq_diff += (diff ** 2).sum(axis=(0, 2))
 
-    std = np.sqrt(np.maximum(chan_sq_diff / total_count, 1e-12))
+    std = np.sqrt(np.maximum(chan_sq_diff / max(total_cnt, 1), 1e-12))
     std[std < 1e-6] = 1.0
 
     log.info(f"[Scaler] mean range [{mean.min():.3f}, {mean.max():.3f}]  "
@@ -663,6 +688,47 @@ def compute_scaler_streaming(train_index, signal_key, win_samples,
 
     return (mean[np.newaxis, :, np.newaxis].astype(np.float32),
             std[np.newaxis, :, np.newaxis].astype(np.float32))
+
+
+# ---------------------------------------------------------------------------
+# Signal processing helpers (paper §Appendix A)
+# ---------------------------------------------------------------------------
+
+def _resample_signal(signal, orig_fs, target_fs):
+    """
+    Resample signal (C, T) or (C,) from orig_fs → target_fs along last axis.
+    No-op when orig_fs == target_fs.
+    """
+    if orig_fs == target_fs:
+        return signal.astype(np.float32)
+    n_out = int(round(signal.shape[-1] * target_fs / orig_fs))
+    return sp_resample(signal, n_out, axis=-1).astype(np.float32)
+
+
+def _apply_fft_features(eeg_clip, fft_features=100):
+    """
+    Convert a raw EEG clip to log-amplitude FFT features (paper §Appendix A).
+
+    Pipeline (per time step, per channel):
+      1. FFT the 1-second segment
+      2. Take non-negative frequency components (skip DC at index 0)
+      3. Log amplitude: log(|FFT|[1 : fft_features+1] + ε)
+
+    Args:
+        eeg_clip:    (T, C, step_samples) float32  –  raw signal after resample
+        fft_features: M = number of frequency bins to keep (default 100 for 200 Hz)
+
+    Returns:
+        fft_clip:    (T, C, M) float32
+    """
+    T, C, S = eeg_clip.shape
+    fft_clip = np.zeros((T, C, fft_features), dtype=np.float32)
+    for t in range(T):
+        for c in range(C):
+            spec = np.fft.rfft(eeg_clip[t, c])          # (S//2 + 1,) complex
+            log_amp = np.log(np.abs(spec[1: fft_features + 1]) + 1e-8)
+            fft_clip[t, c] = log_amp
+    return fft_clip
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +784,9 @@ class CHBMITDatasetHDF5(Dataset):
             fmt, signal_key, group_keys, meta,
             win_samples,
             stride_samples,
-            fs=256,
+            orig_fs=256,
+            target_fs=200,
+            fft_features=100,
             time_step_size=1,
             standardize=True,
             scaler=None,
@@ -727,20 +795,34 @@ class CHBMITDatasetHDF5(Dataset):
             filter_type="laplacian",
             seizure_map=None,
             split="train",
+            undersample=False,
+            undersample_seed=42,
             debug_first_batch=True):
         """
         Do not call directly – use load_dataset_chbmit_hdf5() instead.
+
+        Args:
+            orig_fs:      Native sampling rate of the HDF5 files (e.g. 256 Hz).
+            target_fs:    Target sampling rate after resampling (paper: 200 Hz).
+            fft_features: M – number of log-amplitude FFT bins kept per segment.
+                          (target_fs // 2 = 100 for 200 Hz, 1-second window.)
+            undersample:  If True (train split only), downsample negative clips
+                          so that the training set is ~50% positive (paper §5).
         """
         if standardize and scaler is None:
             raise ValueError("Provide a scaler when standardize=True.")
 
         self.signal_key    = signal_key
         self.fmt           = fmt
-        self.win_samples   = win_samples
-        self.step_samples  = int(time_step_size * fs)
-        self.seq_len       = win_samples // self.step_samples
-        self.input_dim     = self.step_samples
-        self.fs            = fs
+        self.win_samples   = win_samples         # in orig_fs samples (for HDF5 slice)
+        self.orig_fs       = orig_fs
+        self.target_fs     = target_fs
+        self.fft_features  = fft_features
+        # After resampling: 1 second = target_fs samples per DCRNN time step
+        self.step_samples  = target_fs            # = time_step_size(1s) × target_fs
+        # seq_len = win_len seconds (each 1-second segment is one DCRNN step)
+        self.seq_len       = int(round(win_samples * target_fs / orig_fs)) // target_fs
+        self.input_dim     = fft_features         # M log-amplitude FFT bins
         self.standardize   = standardize
         self.scaler        = scaler
         self.graph_type    = graph_type
@@ -760,23 +842,41 @@ class CHBMITDatasetHDF5(Dataset):
             group_keys=group_keys, meta=meta,
             win_samples=win_samples,
             stride_samples=stride_samples,
-            fs=fs,
+            fs=orig_fs,                           # index in native-fs samples
             seizure_map=seizure_map or {},
         )
 
         if not self.index:
             raise RuntimeError(f"[{split}] No windows found in provided HDF5 files.")
 
+        # ── Undersampling (train only) ──────────────────────────────────────
+        N_orig = len(self.index)
+        n_sz_orig = sum(e.label for e in self.index)
+        if undersample and n_sz_orig > 0:
+            pos_idx = [i for i, e in enumerate(self.index) if e.label == 1]
+            neg_idx = [i for i, e in enumerate(self.index) if e.label == 0]
+            n_pos, n_neg = len(pos_idx), len(neg_idx)
+            rng_us = np.random.default_rng(undersample_seed)
+            if n_neg > n_pos:
+                neg_idx = rng_us.choice(neg_idx, n_pos, replace=False).tolist()
+            kept = sorted(pos_idx + neg_idx)
+            self.index = [self.index[i] for i in kept]
+            log.info(
+                f"[{split}] Undersampling: {N_orig} → {len(self.index)} windows | "
+                f"orig pos={n_pos} neg={n_neg} | "
+                f"after pos={len(pos_idx)} neg={len(neg_idx)}"
+            )
+
         N = len(self.index)
         n_sz = sum(e.label for e in self.index)
-        ram_mb = N * 80 / 1e6   # approximate bytes per WindowRecord
-        window_kb = self.num_nodes * win_samples * 4 / 1024
+        ram_mb     = N * 80 / 1e6
+        window_kb  = self.num_nodes * win_samples * 4 / 1024
 
         log.info(
             f"[{split}] Index built: {N} windows | "
             f"{n_sz} seizure ({100*n_sz/N:.1f}%) | "
             f"num_nodes={self.num_nodes} seq_len={self.seq_len} "
-            f"input_dim={self.input_dim}"
+            f"input_dim={self.input_dim} (FFT features)"
         )
         log.info(
             f"[{split}] Memory: index≈{ram_mb:.1f} MB "
@@ -796,30 +896,27 @@ class CHBMITDatasetHDF5(Dataset):
 
     def _load_window(self, entry):
         """
-        Load exactly one (C, win_samples) window from disk.
-        Uses process-local h5py handle cache.
+        Load one raw window (C, win_samples_orig) then resample to target_fs.
+
+        Returns: (C, win_samples_resampled) at target_fs.
         """
         h5 = _get_cached_h5(entry.h5_path)
 
         if self.fmt == "windowed":
-            # Pre-windowed: entry.start is the window index
-            win = h5[self.signal_key][entry.start]    # (C, T_win) or (T_win, C)
-            win = np.array(win, dtype=np.float32)
+            win = np.array(h5[self.signal_key][entry.start], dtype=np.float32)
             if win.shape[0] != self.num_nodes:
                 win = win.T
         else:
-            # Raw: entry.start is the sample offset inside the recording
             ds = _load_signal_from_h5(h5, entry.rec_key, self.signal_key)
-            s = entry.start
-            e = s + entry.win_samples
-            # Detect orientation from shape (avoid loading the whole dataset)
-            C0, T0 = ds.shape if ds.shape[0] < ds.shape[1] else (ds.shape[1], ds.shape[0])
+            s, e = entry.start, entry.start + entry.win_samples
             if ds.shape[0] > ds.shape[1]:          # (T, C) layout
-                win = ds[s:e, :].T.astype(np.float32)   # → (C, win_samples)
+                win = ds[s:e, :].T.astype(np.float32)
             else:                                   # (C, T) layout
                 win = ds[:, s:e].astype(np.float32)
 
-        return win   # (C, win_samples) = (num_nodes, win_samples)
+        # Resample orig_fs → target_fs (paper: 256 → 200 Hz)
+        win = _resample_signal(win, self.orig_fs, self.target_fs)
+        return win   # (C, seq_len * target_fs)
 
     def _get_indiv_graph(self, eeg_clip):
         """Cross-correlation adjacency from un-standardised eeg_clip (seq_len, C, D)."""
@@ -837,46 +934,52 @@ class CHBMITDatasetHDF5(Dataset):
     def __getitem__(self, idx):
         entry = self.index[idx]
 
-        # ── 1. Load raw window (C, win_samples) ─────────────────────────
-        raw = self._load_window(entry)   # (C, win_samples) = (23, 512)
+        # ── 1. Load & resample: (C, seq_len * target_fs) ────────────────
+        raw = self._load_window(entry)          # (C, T_resampled) at target_fs
 
-        # ── 2. Reshape to (seq_len, num_nodes, input_dim) ───────────────
-        #   (23, 512) → (23, 2, 256) → (2, 23, 256)
+        # ── 2. Reshape to (seq_len, C, step_samples) ────────────────────
+        #   e.g. (23, 2400) → (23, 12, 200) → (12, 23, 200)
+        n_steps = self.seq_len
         eeg_clip = raw.reshape(
-            self.num_nodes, self.seq_len, self.input_dim
-        ).transpose(1, 0, 2).copy()   # (seq_len, C, input_dim)
+            self.num_nodes, n_steps, self.step_samples
+        ).transpose(1, 0, 2).copy()            # (seq_len, C, target_fs)
 
-        # ── 3. Standardise ───────────────────────────────────────────────
-        curr_feat = eeg_clip.copy()
+        # ── 3. FFT features: log-amplitude of non-negative frequencies ───
+        #   (seq_len, C, target_fs) → (seq_len, C, fft_features)
+        fft_clip = _apply_fft_features(eeg_clip, self.fft_features)
+
+        # ── 4. Standardise in FFT feature space ──────────────────────────
+        curr_feat = fft_clip.copy()
         if self.standardize:
-            curr_feat = self.scaler.transform(curr_feat)
+            curr_feat = self.scaler.transform(curr_feat)  # (seq_len, C, M)
 
-        # ── 4. Graph ─────────────────────────────────────────────────────
+        # ── 5. Graph (computed on raw time-domain signal) ────────────────
         if self.graph_type == "individual":
-            adj_mat  = self._get_indiv_graph(eeg_clip)   # use raw signal
+            adj_mat  = self._get_indiv_graph(eeg_clip)   # uses raw (seq_len,C,200)
             supports = _compute_supports(adj_mat, self.filter_type)
         else:
             adj_mat  = self._fc_adj
             supports = self._fc_supports
 
-        x       = torch.FloatTensor(curr_feat)          # (seq_len, C, input_dim)
-        y       = torch.FloatTensor([float(entry.label)])  # (1,)
-        seq_len = torch.LongTensor([self.seq_len])       # (1,)
+        x       = torch.FloatTensor(curr_feat)              # (seq_len, C, M)
+        y       = torch.FloatTensor([float(entry.label)])   # (1,)
+        seq_len = torch.LongTensor([self.seq_len])          # (1,)
 
-        # ── Debug print (first item in first batch only) ─────────────────
+        # ── Debug print (first item only) ────────────────────────────────
         if not self._debug_printed:
             self._debug_printed = True
             log.info(
                 f"\n[DEBUG __getitem__ {self.split}]"
-                f"\n  raw window       : {raw.shape}   = (C={self.num_nodes}, T={self.win_samples})"
-                f"\n  eeg_clip (raw)   : {eeg_clip.shape} = (seq_len, C, input_dim)"
-                f"\n  x (standardised) : {tuple(x.shape)}"
-                f"\n  y                : {tuple(y.shape)}  label={entry.label}"
-                f"\n  seq_len          : {tuple(seq_len.shape)}"
-                f"\n  adj_mat          : {adj_mat.shape}"
-                f"\n  num_supports     : {len(supports)}  "
-                f"support[0]={tuple(supports[0].shape)}"
-                f"\n  lazy             : True  (h5py slicing per item)"
+                f"\n  raw window (resampled) : {raw.shape}"
+                f"  = (C={self.num_nodes}, T={raw.shape[-1]}) @{self.target_fs}Hz"
+                f"\n  eeg_clip (time-domain) : {eeg_clip.shape}"
+                f"  = (seq_len={n_steps}, C, step_samples={self.step_samples})"
+                f"\n  fft_clip (log-amp)     : {fft_clip.shape}"
+                f"  = (seq_len, C, M={self.fft_features})"
+                f"\n  x (standardised)       : {tuple(x.shape)}"
+                f"\n  y                      : {tuple(y.shape)}  label={entry.label}"
+                f"\n  supports               : {len(supports)} × {tuple(supports[0].shape)}"
+                f"\n  lazy                   : True (h5py slicing per item)"
             )
 
         return x, y, seq_len, supports, adj_mat, f"chbmit_hdf5_{entry.patient}_{idx}"
@@ -889,13 +992,15 @@ class CHBMITDatasetHDF5(Dataset):
 def load_dataset_chbmit_hdf5(
         hdf5_dir,
         summary_dir=None,
-        train_batch_size=32,
+        train_batch_size=40,
         test_batch_size=64,
-        win_len=2,
-        stride=1,
+        win_len=12,
+        stride=None,            # None → non-overlapping (stride = win_len)
         time_step_size=1,
-        fs=256,
-        graph_type="combined",
+        orig_fs=256,            # native HDF5 sampling rate
+        fs=200,                 # target sampling rate after resampling (paper)
+        fft_features=100,       # M log-amplitude FFT bins (paper: fs//2)
+        graph_type="individual",
         top_k=3,
         filter_type=None,       # auto-set from graph_type if None
         standardize=True,
@@ -904,6 +1009,7 @@ def load_dataset_chbmit_hdf5(
         val_ratio=0.15,
         seed=123,
         min_channels=None,
+        undersample_train=True,  # 50/50 neg undersampling on train (paper §5)
         inspect_first_file=True,
 ):
     """
@@ -912,23 +1018,25 @@ def load_dataset_chbmit_hdf5(
     Args:
         hdf5_dir:          root dir containing HDF5 files or patient sub-dirs.
                            Searched recursively for *.h5 and *.hdf5 files.
-        summary_dir:       optional path to CHB-MIT summary .txt files.
-                           Used as fallback if HDF5 files lack seizure annotations.
-        train_batch_size:  batch size for training
+        summary_dir:       optional CHB-MIT summary .txt dir (fallback labels).
+        train_batch_size:  batch size for training (paper: 40)
         test_batch_size:   batch size for dev / test
-        win_len:           window length in seconds (default 2)
-        stride:            stride in seconds (default 1)
-        time_step_size:    seconds per DCRNN time step (default 1)
-        fs:                expected sampling rate Hz (default 256)
+        win_len:           clip length in seconds (paper: 12 or 60)
+        stride:            stride in seconds; None → non-overlapping (= win_len)
+        time_step_size:    seconds per DCRNN time step (always 1 for paper)
+        orig_fs:           native HDF5 sampling rate (CHB-MIT: 256 Hz)
+        fs:                target sampling rate after resampling (paper: 200 Hz)
+        fft_features:      M – log-amplitude FFT bins per segment (paper: 100)
         graph_type:        'individual' (xcorr) | 'combined' (FC fallback)
-        top_k:             neighbours for xcorr graph
+        top_k:             neighbours for xcorr graph (paper: τ=3)
         filter_type:       overrides graph_type-derived filter (advanced use)
-        standardize:       z-normalise with streaming scaler
+        standardize:       z-normalise FFT features with streaming scaler
         num_workers:       DataLoader workers (use 0 for debugging)
         train_ratio:       fraction of patients in train split
         val_ratio:         fraction of patients in dev split
         seed:              RNG seed for patient-level split
         min_channels:      skip recordings with fewer than this many channels
+        undersample_train: if True, downsample negatives to 50/50 (paper §5)
         inspect_first_file: if True, log full structure of the first HDF5 found
 
     Returns:
@@ -965,8 +1073,13 @@ def load_dataset_chbmit_hdf5(
         log.info(f"Loaded seizure annotations for "
                  f"{len(seizure_map)} EDF file(s) from {summary_dir}.")
 
-    win_samples    = int(win_len * fs)
-    stride_samples = int(stride * fs)
+    if stride is None:
+        stride = win_len                         # non-overlapping (paper default)
+
+    win_samples    = int(win_len * orig_fs)      # in native-fs samples
+    stride_samples = int(stride * orig_fs)
+
+    fft_features = fft_features or (fs // 2)    # default: 100 for 200 Hz
 
     if filter_type is None:
         filter_type = "dual_random_walk" if graph_type == "individual" else "laplacian"
@@ -1014,7 +1127,7 @@ def load_dataset_chbmit_hdf5(
         group_keys=group_keys, meta=meta,
         win_samples=win_samples,
         stride_samples=stride_samples,
-        fs=fs,
+        fs=orig_fs,                              # index uses native fs
         seizure_map=seizure_map,
         min_channels=min_channels,
     )
@@ -1022,12 +1135,22 @@ def load_dataset_chbmit_hdf5(
     if not train_idx:
         raise RuntimeError("No training windows found. Check hdf5_dir and summary_dir.")
 
-    # Streaming scaler (one recording in RAM at a time)
+    n_pos_train = sum(e.label for e in train_idx)
+    n_neg_train = len(train_idx) - n_pos_train
+    log.info(
+        f"[train] Original: {len(train_idx)} windows | "
+        f"pos={n_pos_train} ({100*n_pos_train/len(train_idx):.1f}%) | "
+        f"neg={n_neg_train}"
+    )
+
+    # Streaming scaler in FFT feature space (one recording in RAM at a time)
     if standardize:
         mean_arr, std_arr = compute_scaler_streaming(
             train_idx, signal_key,
-            win_samples, int(time_step_size * fs),
-            num_nodes, fmt)
+            win_samples, int(time_step_size * orig_fs),
+            num_nodes, fmt,
+            orig_fs=orig_fs, target_fs=fs,
+            fft_features=fft_features)
         scaler = utils.StandardScaler(mean=mean_arr, std=std_arr)
     else:
         scaler = None
@@ -1036,7 +1159,8 @@ def load_dataset_chbmit_hdf5(
     common_kwargs = dict(
         fmt=fmt, signal_key=signal_key, group_keys=group_keys, meta=meta,
         win_samples=win_samples, stride_samples=stride_samples,
-        fs=fs, time_step_size=time_step_size,
+        orig_fs=orig_fs, target_fs=fs, fft_features=fft_features,
+        time_step_size=time_step_size,
         standardize=standardize, scaler=scaler,
         graph_type=graph_type, top_k=top_k, filter_type=filter_type,
         seizure_map=seizure_map,
@@ -1047,6 +1171,7 @@ def load_dataset_chbmit_hdf5(
         ds = CHBMITDatasetHDF5(
             hdf5_paths=split_files[split],
             split=split,
+            undersample=(split == "train" and undersample_train),
             debug_first_batch=(split == "train"),
             **common_kwargs,
         )
