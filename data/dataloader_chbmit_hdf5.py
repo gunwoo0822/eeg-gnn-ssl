@@ -887,6 +887,7 @@ class CHBMITDatasetHDF5(Dataset):
         self._fc_adj      = _build_fc_adj(self.num_nodes)
         self._fc_supports = _compute_supports(self._fc_adj, "laplacian")
         self._targets     = [e.label for e in self.index]
+        self._graph_debug_printed = False   # print graph shapes on first call
 
     def __len__(self):
         return len(self.index)
@@ -919,17 +920,83 @@ class CHBMITDatasetHDF5(Dataset):
         return win   # (C, seq_len * target_fs)
 
     def _get_indiv_graph(self, eeg_clip):
-        """Cross-correlation adjacency from un-standardised eeg_clip (seq_len, C, D)."""
-        C = eeg_clip.shape[1]
-        adj = np.eye(C, dtype=np.float32)
-        flat = eeg_clip.transpose(1, 0, 2).reshape(C, -1)
-        for i in range(C):
-            for j in range(i + 1, C):
-                xc = comp_xcorr(flat[i], flat[j], mode="valid", normalize=True)
-                adj[i, j] = xc
-                adj[j, i] = xc
+        """
+        Compute per-clip correlation adjacency matrix (paper §2, Corr-DCRNN).
+
+        Method (vectorised):
+          1. Concatenate all T time steps along the temporal axis:
+               (T, C, step_samples) → (C, T×step_samples)
+          2. Compute normalised zero-lag cross-correlation for every channel pair
+             via the gram matrix:
+               adj[i,j] = dot(xi, xj) / (||xi|| × ||xj||)
+             This is mathematically identical to scipy.signal.correlate(mode='valid')
+             with normalization, but returns guaranteed scalar (C,C) float32 values
+             and is O(C²) faster than the nested loop.
+          3. Take absolute value, restore self-edges to 1.
+          4. Apply top-k sparsification (paper: τ=3 per node).
+
+        Args:
+            eeg_clip: (seq_len, C, step_samples) – raw time-domain signal at
+                      target_fs (200 Hz), BEFORE FFT.
+
+        Returns:
+            adj_mat: (C, C) float32, directed top-k sparse.
+        """
+        T, C, S = eeg_clip.shape
+
+        # (T, C, S) → (C, T*S): concatenate all time steps per channel
+        flat = eeg_clip.transpose(1, 0, 2).reshape(C, -1).astype(np.float64)
+
+        # ── Debug (first call only) ──────────────────────────────────────
+        if not self._graph_debug_printed:
+            self._graph_debug_printed = True
+            log.info(
+                f"\n[Graph debug] eeg_clip input  : {eeg_clip.shape}"
+                f"  = (seq_len={T}, C={C}, step_samples={S})"
+                f"\n[Graph debug] flat (concat)   : {flat.shape}"
+                f"  = (C={C}, T×S={T*S})"
+            )
+
+        # ── Vectorised normalised cross-correlation ──────────────────────
+        # gram[i,j] = dot(flat[i], flat[j])
+        gram = flat @ flat.T                                # (C, C) float64
+
+        # L2 norms: sqrt of diagonal of gram matrix
+        norms = np.sqrt(np.maximum(np.diag(gram), 0.0))    # (C,)  ||flat[i]||
+
+        # Outer product of norms = normalisation denominator
+        norm_prod = np.outer(norms, norms)                  # (C, C)
+        norm_prod[norm_prod < 1e-12] = 1.0                  # guard against zero
+
+        adj = (gram / norm_prod).astype(np.float32)         # (C, C) ∈ [-1, 1]
+
+        # ── Debug: intermediate correlation stats ────────────────────────
+        if not getattr(self, '_graph_debug2_printed', False):
+            self._graph_debug2_printed = True
+            off = adj[~np.eye(C, dtype=bool)]
+            log.info(
+                f"[Graph debug] corr matrix      : shape={adj.shape}"
+                f"  min={adj.min():.3f}  max={adj.max():.3f}"
+                f"  off-diag mean={off.mean():.3f}  std={off.std():.3f}"
+            )
+
+        # ── Top-k sparsification ─────────────────────────────────────────
         adj = np.abs(adj)
-        return keep_topk(adj, top_k=self.top_k, directed=True)
+        np.fill_diagonal(adj, 1.0)
+        adj = keep_topk(adj, top_k=self.top_k, directed=True)
+
+        # ── Debug: final adjacency ────────────────────────────────────────
+        if not getattr(self, '_graph_debug3_printed', False):
+            self._graph_debug3_printed = True
+            nnz = np.count_nonzero(adj)
+            log.info(
+                f"[Graph debug] final adj        : shape={adj.shape}"
+                f"  nnz={nnz}"
+                f"  (self-edges={C} + top-{self.top_k} per node"
+                f" ≤ {C + C * self.top_k})"
+            )
+
+        return adj
 
     def __getitem__(self, idx):
         entry = self.index[idx]
