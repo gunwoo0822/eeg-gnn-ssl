@@ -98,6 +98,11 @@ def get_args():
                         help="Top-k neighbours for cross-correlation graph (paper: τ=3).")
     parser.add_argument("--no_undersample", action="store_true", default=False,
                         help="Disable 50/50 negative undersampling on train set.")
+    parser.add_argument("--seizure_stride", type=float, default=None,
+                        help="Dense stride in seconds for seizure-region oversampling "
+                             "on the train set (e.g. 1 or 2). "
+                             "None = disabled (non-overlapping everywhere). "
+                             "Must be < win_len. dev/test are never affected.")
     parser.add_argument("--train_ratio", type=float, default=0.70,
                         help="Fraction of patients used for training.")
     parser.add_argument("--val_ratio",   type=float, default=0.15,
@@ -363,6 +368,7 @@ def main():
             val_ratio=args.val_ratio,
             seed=args.rand_seed,
             undersample_train=(not args.no_undersample),
+            seizure_stride=args.seizure_stride,
             inspect_first_file=True,
         )
     else:
@@ -397,9 +403,12 @@ def main():
     targets  = train_ds.targets()
     n_pos    = int(sum(targets))
     n_neg    = len(targets) - n_pos
+    sz_stride_str = (
+        f"seizure_stride={args.seizure_stride}s" if args.seizure_stride else "no oversampling"
+    )
     log.info(
-        f"Train set (after undersampling): {len(targets)} clips | "
-        f"pos={n_pos} ({100*n_pos/max(len(targets),1):.1f}%) | neg={n_neg}"
+        f"Train set final  ({sz_stride_str}, 1:1 undersample={not args.no_undersample}): "
+        f"total={len(targets)} | pos={n_pos} ({100*n_pos/max(len(targets),1):.1f}%) | neg={n_neg}"
     )
     log.info(
         f"DCRNN config: num_nodes={args.num_nodes}  "

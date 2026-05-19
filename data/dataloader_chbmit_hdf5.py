@@ -418,36 +418,51 @@ def _build_index(
         hdf5_paths,
         fmt, signal_key, group_keys, meta,
         win_samples, stride_samples, fs,
-        seizure_map,        # dict from _parse_summary_dir (may be empty)
-        min_channels=None,  # enforce channel count
+        seizure_map,              # dict from _parse_summary_dir (may be empty)
+        min_channels=None,        # enforce channel count
+        seizure_stride_samples=None,  # dense stride for seizure regions (None = disabled)
 ):
     """
     Build the lightweight window index.
 
+    Two-pass windowing (when seizure_stride_samples is set):
+      Pass 1 – non-overlapping baseline  (stride = stride_samples, all clips)
+      Pass 2 – dense seizure oversampling (stride = seizure_stride_samples)
+               Slides with the small stride only inside each seizure interval,
+               adding only positive clips not already in the index.
+    Duplicate start positions within the same recording are deduplicated via a
+    per-recording ``seen_starts`` set.
+
     Returns:
-        index:       list[WindowRecord]
-        num_nodes:   int – number of EEG channels detected
+        index:        list[WindowRecord]
+        num_nodes:    int  – number of EEG channels detected
         ref_channels: list[str] or None
     """
+    do_dense = (
+        seizure_stride_samples is not None
+        and seizure_stride_samples > 0
+        and seizure_stride_samples < stride_samples
+    )
+
     index = []
-    ref_channels = None
+    ref_channels  = None
     ref_num_nodes = None
 
     for h5_path in hdf5_paths:
         patient = Path(h5_path).stem.split("_")[0]   # "chb01" from "chb01_03.h5"
-        # For per-patient files (grouped), the patient is the stem itself
         if fmt == "raw_grouped":
             patient = Path(h5_path).stem
 
         try:
             with h5py.File(str(h5_path), "r") as f:
-                # Collect (rec_key, sz_intervals) pairs to process
                 recordings = []
+
                 if fmt == "windowed":
-                    # Pre-windowed: each HDF5 index maps to one window
+                    # Pre-windowed: each HDF5 index maps to one window;
+                    # dense oversampling not applicable.
                     y_key = meta["y_key"]
                     N, C, T_win = f[signal_key].shape
-                    y_arr = f[y_key][()].astype(np.int32)   # load labels only (tiny)
+                    y_arr = f[y_key][()].astype(np.int32)
 
                     if ref_num_nodes is None:
                         ref_num_nodes = C
@@ -464,14 +479,14 @@ def _build_index(
                         index.append(WindowRecord(
                             h5_path=str(h5_path),
                             rec_key=None,
-                            start=i,        # reused as window index for windowed fmt
+                            start=i,
                             label=int(y_arr[i]),
                             patient=patient,
                             win_samples=win_samples,
                         ))
                     log.info(f"  {Path(h5_path).name}: {N} pre-windowed windows, "
                              f"seizure_ratio={y_arr.mean():.4f}")
-                    continue   # skip raw processing below
+                    continue
 
                 elif fmt == "raw_grouped":
                     recs_in_file = group_keys if group_keys else list(f.keys())
@@ -480,7 +495,6 @@ def _build_index(
                             continue
                         sz_key = meta.get("sz_key")
                         sz = _load_seizure_times_from_h5(f, rk, sz_key, fs)
-                        # Fallback to summary map
                         if not sz:
                             edf_name = rk + ".edf"
                             sz = [
@@ -507,12 +521,11 @@ def _build_index(
                                 f"but no seizure intervals → all windows labelled 1")
                     recordings.append((None, sz))
 
-                # ── Process raw recordings ─────────────────────────────
+                # ── Process raw recordings ──────────────────────────────
                 for rec_key, sz_sample_intervals in recordings:
                     ds = _load_signal_from_h5(f, rec_key, signal_key)
-                    # Detect orientation: C is the smaller axis
                     s0, s1 = ds.shape
-                    if s0 > s1:                    # likely (T, C) → transpose
+                    if s0 > s1:
                         C, T = s1, s0
                         transposed = True
                     else:
@@ -521,7 +534,6 @@ def _build_index(
 
                     if ref_num_nodes is None:
                         ref_num_nodes = C
-                        # Try to read channel names
                         try:
                             ch_node = f.get("channels") or f.get("channel_names")
                             if ch_node is not None:
@@ -543,17 +555,21 @@ def _build_index(
                             f"Skipping rec: C={C} < min_channels={min_channels}")
                         continue
 
-                    # Sliding window index computation
+                    rec_name = rec_key or Path(h5_path).name
+
+                    # ── Pass 1: baseline non-overlapping windows ────────
                     win_count = 0
-                    sz_count = 0
+                    sz_count  = 0
+                    seen_starts: set = set()   # dedup per recording
                     start = 0
                     while start + win_samples <= T:
-                        end = start + win_samples
+                        end   = start + win_samples
                         label = 0
                         for sz_s, sz_e in sz_sample_intervals:
                             if not (end <= sz_s or start >= sz_e):
                                 label = 1
                                 break
+                        seen_starts.add(start)
                         index.append(WindowRecord(
                             h5_path=str(h5_path),
                             rec_key=rec_key,
@@ -563,13 +579,60 @@ def _build_index(
                             win_samples=win_samples,
                         ))
                         win_count += 1
-                        sz_count += label
-                        start += stride_samples
+                        sz_count  += label
+                        start     += stride_samples
 
-                    rec_name = rec_key or Path(h5_path).name
+                    sz_baseline = sz_count   # how many positives from pass 1
+
+                    # ── Pass 2: dense seizure oversampling ──────────────
+                    # Only for recordings that have at least one seizure interval
+                    # and only when the caller requested dense sampling.
+                    extra_sz = 0
+                    if do_dense and sz_sample_intervals:
+                        for sz_s, sz_e in sz_sample_intervals:
+                            # All windows that overlap [sz_s, sz_e):
+                            #   start < sz_e  AND  start + win_samples > sz_s
+                            # → start ∈ [max(0, sz_s - win_samples + 1),  sz_e)
+                            dense_begin = max(
+                                0,
+                                sz_s - win_samples + seizure_stride_samples
+                            )
+                            # Align to seizure_stride_samples grid
+                            dense_begin = (
+                                (dense_begin // seizure_stride_samples)
+                                * seizure_stride_samples
+                            )
+                            s = dense_begin
+                            while s + win_samples <= T and s < sz_e:
+                                if s not in seen_starts:
+                                    e = s + win_samples
+                                    # Check against all seizure intervals
+                                    lbl = 0
+                                    for s2, e2 in sz_sample_intervals:
+                                        if not (e <= s2 or s >= e2):
+                                            lbl = 1
+                                            break
+                                    if lbl == 1:
+                                        seen_starts.add(s)
+                                        index.append(WindowRecord(
+                                            h5_path=str(h5_path),
+                                            rec_key=rec_key,
+                                            start=s,
+                                            label=1,
+                                            patient=patient,
+                                            win_samples=win_samples,
+                                        ))
+                                        win_count += 1
+                                        sz_count  += 1
+                                        extra_sz  += 1
+                                s += seizure_stride_samples
+
+                    sz_str = str(sz_baseline)
+                    if extra_sz:
+                        sz_str += f" +{extra_sz} dense"
                     log.info(
                         f"  {rec_name}: shape=({C},{T}) transposed={transposed} "
-                        f"→ {win_count} windows, {sz_count} seizure"
+                        f"→ {win_count} windows, {sz_count} seizure ({sz_str})"
                     )
 
         except Exception as e:
@@ -797,6 +860,7 @@ class CHBMITDatasetHDF5(Dataset):
             split="train",
             undersample=False,
             undersample_seed=42,
+            seizure_stride_samples=None,
             debug_first_batch=True):
         """
         Do not call directly – use load_dataset_chbmit_hdf5() instead.
@@ -844,14 +908,24 @@ class CHBMITDatasetHDF5(Dataset):
             stride_samples=stride_samples,
             fs=orig_fs,                           # index in native-fs samples
             seizure_map=seizure_map or {},
+            seizure_stride_samples=seizure_stride_samples,
         )
 
         if not self.index:
             raise RuntimeError(f"[{split}] No windows found in provided HDF5 files.")
 
         # ── Undersampling (train only) ──────────────────────────────────────
-        N_orig = len(self.index)
+        N_orig    = len(self.index)
         n_sz_orig = sum(e.label for e in self.index)
+        n_ns_orig = N_orig - n_sz_orig
+
+        if seizure_stride_samples is not None and seizure_stride_samples < stride_samples:
+            log.info(
+                f"[{split}] Seizure oversampling (dense stride="
+                f"{seizure_stride_samples} orig-fs samples): "
+                f"total={N_orig} | pos={n_sz_orig} | neg={n_ns_orig}"
+            )
+
         if undersample and n_sz_orig > 0:
             pos_idx = [i for i, e in enumerate(self.index) if e.label == 1]
             neg_idx = [i for i, e in enumerate(self.index) if e.label == 0]
@@ -862,9 +936,10 @@ class CHBMITDatasetHDF5(Dataset):
             kept = sorted(pos_idx + neg_idx)
             self.index = [self.index[i] for i in kept]
             log.info(
-                f"[{split}] Undersampling: {N_orig} → {len(self.index)} windows | "
-                f"orig pos={n_pos} neg={n_neg} | "
-                f"after pos={len(pos_idx)} neg={len(neg_idx)}"
+                f"[{split}] Undersampling (1:1): "
+                f"before pos={n_pos} neg={n_neg} | "
+                f"after  pos={len(pos_idx)} neg={len(neg_idx)} | "
+                f"total={len(self.index)}"
             )
 
         N = len(self.index)
@@ -1077,6 +1152,7 @@ def load_dataset_chbmit_hdf5(
         seed=123,
         min_channels=None,
         undersample_train=True,  # 50/50 neg undersampling on train (paper §5)
+        seizure_stride=None,     # dense stride (seconds) for seizure oversampling; None=disabled
         inspect_first_file=True,
 ):
     """
@@ -1104,6 +1180,10 @@ def load_dataset_chbmit_hdf5(
         seed:              RNG seed for patient-level split
         min_channels:      skip recordings with fewer than this many channels
         undersample_train: if True, downsample negatives to 50/50 (paper §5)
+        seizure_stride:    dense stride in seconds used ONLY for the train set to
+                           oversample positive (seizure) clips around each seizure
+                           interval.  None (default) = no oversampling.
+                           Typical values: 1 or 2.  Must be < win_len.
         inspect_first_file: if True, log full structure of the first HDF5 found
 
     Returns:
@@ -1145,6 +1225,20 @@ def load_dataset_chbmit_hdf5(
 
     win_samples    = int(win_len * orig_fs)      # in native-fs samples
     stride_samples = int(stride * orig_fs)
+
+    # Dense-stride oversampling (train only)
+    if seizure_stride is not None and seizure_stride >= win_len:
+        raise ValueError(
+            f"seizure_stride ({seizure_stride}s) must be < win_len ({win_len}s)")
+    train_seizure_stride_samples = (
+        int(seizure_stride * orig_fs) if seizure_stride is not None else None
+    )
+    if train_seizure_stride_samples is not None:
+        log.info(
+            f"Seizure oversampling ENABLED: seizure_stride={seizure_stride}s "
+            f"({train_seizure_stride_samples} orig-fs samples) — train only. "
+            f"dev/test: no oversampling."
+        )
 
     fft_features = fft_features or (fs // 2)    # default: 100 for 200 Hz
 
@@ -1235,10 +1329,16 @@ def load_dataset_chbmit_hdf5(
 
     dataloaders, datasets = {}, {}
     for split in ("train", "dev", "test"):
+        # Dense seizure oversampling applies to train only;
+        # dev and test keep the original non-overlapping distribution.
+        split_seizure_stride = (
+            train_seizure_stride_samples if split == "train" else None
+        )
         ds = CHBMITDatasetHDF5(
             hdf5_paths=split_files[split],
             split=split,
             undersample=(split == "train" and undersample_train),
+            seizure_stride_samples=split_seizure_stride,
             debug_first_batch=(split == "train"),
             **common_kwargs,
         )
