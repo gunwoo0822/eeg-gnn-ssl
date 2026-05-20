@@ -32,8 +32,10 @@ def resample_all(raw_edf_dir, save_dir):
             orderedChannels = getOrderedChannels(
                 edf_fn, False, f.getSignalLabels(), INCLUDED_CHANNELS
             )
-            signals = getEDFsignals(f)
-            signal_array = np.array(signals[orderedChannels, :])
+            # Read only the 19 EEG channels required by INCLUDED_CHANNELS.
+            # Do not read all EDF channels, because TUSZ 2.x contains extra
+            # channels such as PHOTIC/DC/EKG that may fail with pyedflib.
+            signal_array = np.array([f.readSignal(ch) for ch in orderedChannels])
             sample_freq = f.getSampleFrequency(0)
             if sample_freq != FREQUENCY:
                 signal_array = resampleData(
@@ -44,7 +46,7 @@ def resample_all(raw_edf_dir, save_dir):
 
             with h5py.File(save_fn, "w") as hf:
                 hf.create_dataset("resampled_signal", data=signal_array)
-            hf.create_dataset("resample_freq", data=FREQUENCY)
+                hf.create_dataset("resample_freq", data=FREQUENCY)
 
         except BaseException:
             failed_files.append(edf_fn)
