@@ -98,6 +98,11 @@ def get_args():
                         help="Top-k neighbours for cross-correlation graph (paper: τ=3).")
     parser.add_argument("--no_undersample", action="store_true", default=False,
                         help="Disable 50/50 negative undersampling on train set.")
+    parser.add_argument("--undersample_dev", action="store_true", default=False,
+                        help="Apply 1:1 negative undersampling to the dev set as well. "
+                             "Default OFF (original distribution). "
+                             "test set is NEVER undersampled regardless of this flag. "
+                             "Threshold sweep uses the (possibly undersampled) dev set.")
     parser.add_argument("--seizure_stride", type=float, default=None,
                         help="Dense stride in seconds for seizure-region oversampling "
                              "on the train set (e.g. 1 or 2). "
@@ -163,7 +168,19 @@ def get_args():
 
 def evaluate(model, dataloader, device, args,
              debug_shapes=False, threshold=0.5, return_probs=False):
-    """Run model on dataloader; return metrics dict (and optionally raw arrays)."""
+    """
+    Run model on dataloader; return ordered metrics dict.
+
+    Metrics (in display order):
+        acc, F1, precision, recall, specificity, auroc, auprc, loss, threshold
+
+    specificity = TN / (TN + FP)   – meaningful for imbalanced datasets
+    auprc       = area under precision-recall curve (average_precision_score)
+                  threshold-independent; critical when positives are rare
+    """
+    from sklearn.metrics import confusion_matrix, average_precision_score
+    from collections import OrderedDict
+
     model.eval()
     loss_fn = nn.BCEWithLogitsLoss().to(device)
 
@@ -195,10 +212,36 @@ def evaluate(model, dataloader, device, args,
     y_true_all = np.concatenate(y_true_all)
     y_pred_all = (y_prob_all >= threshold).astype(int)
 
-    scores, _, _ = utils.eval_dict(
+    # ── Base metrics from utils.eval_dict ────────────────────────────────
+    base_scores, _, _ = utils.eval_dict(
         y_pred=y_pred_all, y=y_true_all, y_prob=y_prob_all, average="binary")
-    scores["loss"] = total_loss / max(n_batches, 1)
-    scores["threshold"] = threshold
+
+    # ── Specificity: TN / (TN + FP) ──────────────────────────────────────
+    try:
+        cm = confusion_matrix(y_true_all, y_pred_all, labels=[0, 1])
+        tn, fp = int(cm[0, 0]), int(cm[0, 1])
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    except Exception:
+        specificity = 0.0
+
+    # ── AUPRC (threshold-independent) ────────────────────────────────────
+    try:
+        auprc = float(average_precision_score(y_true_all, y_prob_all))
+    except Exception:
+        auprc = float("nan")
+
+    # ── Assemble in desired display order ─────────────────────────────────
+    scores = OrderedDict([
+        ("acc",         base_scores.get("acc",       0.0)),
+        ("F1",          base_scores.get("F1",        0.0)),
+        ("precision",   base_scores.get("precision", 0.0)),
+        ("recall",      base_scores.get("recall",    0.0)),
+        ("specificity", specificity),
+        ("auroc",       base_scores.get("auroc",     float("nan"))),
+        ("auprc",       auprc),
+        ("loss",        total_loss / max(n_batches, 1)),
+        ("threshold",   threshold),
+    ])
 
     if return_probs:
         return scores, y_true_all, y_prob_all
@@ -368,6 +411,7 @@ def main():
             val_ratio=args.val_ratio,
             seed=args.rand_seed,
             undersample_train=(not args.no_undersample),
+            undersample_dev=args.undersample_dev,
             seizure_stride=args.seizure_stride,
             inspect_first_file=True,
         )
@@ -400,6 +444,7 @@ def main():
         log.info(f"Setting num_nodes: {args.num_nodes} → {train_ds.num_nodes}")
         args.num_nodes = train_ds.num_nodes
 
+    # ── Train set stats ───────────────────────────────────────────────────
     targets  = train_ds.targets()
     n_pos    = int(sum(targets))
     n_neg    = len(targets) - n_pos
@@ -409,6 +454,17 @@ def main():
     log.info(
         f"Train set final  ({sz_stride_str}, 1:1 undersample={not args.no_undersample}): "
         f"total={len(targets)} | pos={n_pos} ({100*n_pos/max(len(targets),1):.1f}%) | neg={n_neg}"
+    )
+
+    # ── Dev set stats ─────────────────────────────────────────────────────
+    dev_ds = datasets["dev"]
+    dev_tgt = dev_ds.targets()
+    dev_pos = int(sum(dev_tgt))
+    dev_neg = len(dev_tgt) - dev_pos
+    dev_dist_str = "undersampled 1:1" if args.undersample_dev else "original distribution"
+    log.info(
+        f"Dev  set ({dev_dist_str}): "
+        f"total={len(dev_tgt)} | pos={dev_pos} ({100*dev_pos/max(len(dev_tgt),1):.2f}%) | neg={dev_neg}"
     )
     log.info(
         f"DCRNN config: num_nodes={args.num_nodes}  "
@@ -437,15 +493,21 @@ def main():
             log.info("Loaded best checkpoint for final evaluation.")
 
     # ── Threshold sweep on dev set ────────────────────────────────────────
-    log.info("Running threshold sweep on dev set …")
+    dev_sweep_note = (
+        "undersampled dev (1:1)" if args.undersample_dev else "original dev distribution"
+    )
+    log.info(f"Running threshold sweep on dev set [{dev_sweep_note}] …")
     dev_scores_05, dev_true, dev_prob = evaluate(
         model, dataloaders["dev"], device, args,
         threshold=0.5, return_probs=True)
     best_thresh, best_dev_scores, sweep_rows = sweep_threshold(dev_true, dev_prob)
-    log.info(f"Best threshold (dev F1): {best_thresh:.2f}  "
-             f"F1={best_dev_scores['F1']:.4f}  "
-             f"precision={best_dev_scores['precision']:.4f}  "
-             f"recall={best_dev_scores['recall']:.4f}")
+    log.info(
+        f"Best threshold ({dev_sweep_note}, maximise dev F1): "
+        f"threshold={best_thresh:.2f}  "
+        f"F1={best_dev_scores['F1']:.4f}  "
+        f"precision={best_dev_scores['precision']:.4f}  "
+        f"recall={best_dev_scores['recall']:.4f}"
+    )
 
     # ── Final evaluation ──────────────────────────────────────────────────
     for split in ["dev", "test"]:

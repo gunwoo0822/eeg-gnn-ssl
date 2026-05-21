@@ -1152,6 +1152,7 @@ def load_dataset_chbmit_hdf5(
         seed=123,
         min_channels=None,
         undersample_train=True,  # 50/50 neg undersampling on train (paper §5)
+        undersample_dev=False,   # 50/50 neg undersampling on dev (experimental; default OFF)
         seizure_stride=None,     # dense stride (seconds) for seizure oversampling; None=disabled
         inspect_first_file=True,
 ):
@@ -1179,7 +1180,9 @@ def load_dataset_chbmit_hdf5(
         val_ratio:         fraction of patients in dev split
         seed:              RNG seed for patient-level split
         min_channels:      skip recordings with fewer than this many channels
-        undersample_train: if True, downsample negatives to 50/50 (paper §5)
+        undersample_train: if True, downsample negatives to 50/50 on train (paper §5)
+        undersample_dev:   if True, apply the same 1:1 undersampling to dev set.
+                           Default False (original distribution). test is never undersampled.
         seizure_stride:    dense stride in seconds used ONLY for the train set to
                            oversample positive (seizure) clips around each seizure
                            interval.  None (default) = no oversampling.
@@ -1329,15 +1332,25 @@ def load_dataset_chbmit_hdf5(
 
     dataloaders, datasets = {}, {}
     for split in ("train", "dev", "test"):
-        # Dense seizure oversampling applies to train only;
-        # dev and test keep the original non-overlapping distribution.
+        # Dense seizure oversampling: train only
         split_seizure_stride = (
             train_seizure_stride_samples if split == "train" else None
         )
+        # Undersampling:
+        #   train  → always controlled by undersample_train
+        #   dev    → controlled by undersample_dev (experimental)
+        #   test   → NEVER undersampled
+        if split == "train":
+            do_undersample = undersample_train
+        elif split == "dev":
+            do_undersample = undersample_dev
+        else:
+            do_undersample = False   # test: always original distribution
+
         ds = CHBMITDatasetHDF5(
             hdf5_paths=split_files[split],
             split=split,
-            undersample=(split == "train" and undersample_train),
+            undersample=do_undersample,
             seizure_stride_samples=split_seizure_stride,
             debug_first_batch=(split == "train"),
             **common_kwargs,
