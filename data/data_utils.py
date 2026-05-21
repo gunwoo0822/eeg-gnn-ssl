@@ -84,21 +84,56 @@ def getSeizureTimes(file_name):
     Args:
         file_name: edf file name
     Returns:
-        seizure_times: list of times of seizure onset in seconds
+        seizure_times: list of [start, end] seizure times in seconds.
+
+    Supports:
+        - Original TUSZ .tse_bi annotation files
+        - Newer TUSZ .csv_bi annotation files
     """
-    tse_file = file_name.split(".edf")[0] + ".tse_bi"
+    import os
+    import csv
+
+    base_name = file_name.split(".edf")[0]
+    csv_bi_file = base_name + ".csv_bi"
+    tse_bi_file = base_name + ".tse_bi"
 
     seizure_times = []
-    with open(tse_file) as f:
-        for line in f.readlines():
-            if "seiz" in line:  # if seizure
-                # seizure start and end time
-                seizure_times.append(
-                    [
-                        float(line.strip().split(" ")[0]),
-                        float(line.strip().split(" ")[1]),
-                    ]
-                )
+
+    if os.path.exists(csv_bi_file):
+        with open(csv_bi_file, "r") as f:
+            reader = csv.reader(line for line in f if not line.startswith("#"))
+            header = next(reader, None)
+
+            for row in reader:
+                if len(row) < 5:
+                    continue
+
+                label = row[3].strip().lower()
+                if label != "bckg":
+                    seizure_times.append(
+                        [
+                            float(row[1]),
+                            float(row[2]),
+                        ]
+                    )
+
+    elif os.path.exists(tse_bi_file):
+        with open(tse_bi_file) as f:
+            for line in f.readlines():
+                if "seiz" in line:  # if seizure
+                    seizure_times.append(
+                        [
+                            float(line.strip().split(" ")[0]),
+                            float(line.strip().split(" ")[1]),
+                        ]
+                    )
+
+    else:
+        raise FileNotFoundError(
+            f"No annotation file found for {file_name}. "
+            f"Expected {csv_bi_file} or {tse_bi_file}"
+        )
+
     return seizure_times
 
 
