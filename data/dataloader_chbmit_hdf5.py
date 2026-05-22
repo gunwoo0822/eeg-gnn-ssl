@@ -860,6 +860,7 @@ class CHBMITDatasetHDF5(Dataset):
             split="train",
             undersample=False,
             undersample_seed=42,
+            neg_ratio=1,
             seizure_stride_samples=None,
             debug_first_batch=True):
         """
@@ -871,7 +872,11 @@ class CHBMITDatasetHDF5(Dataset):
             fft_features: M – number of log-amplitude FFT bins kept per segment.
                           (target_fs // 2 = 100 for 200 Hz, 1-second window.)
             undersample:  If True (train split only), downsample negative clips
-                          so that the training set is ~50% positive (paper §5).
+                          so that the training set is 50% positive (paper §5).
+            neg_ratio:    Number of negative clips kept per positive clip when
+                          undersampling is active (default 1 → 1:1).
+                          E.g. neg_ratio=3 gives positive:negative = 1:3.
+                          Ignored when undersample=False.
         """
         if standardize and scaler is None:
             raise ValueError("Provide a scaler when standardize=True.")
@@ -893,6 +898,7 @@ class CHBMITDatasetHDF5(Dataset):
         self.top_k         = top_k
         self.filter_type   = filter_type
         self.split         = split
+        self.neg_ratio     = max(1, int(neg_ratio))   # positive:negative = 1:neg_ratio
         self._debug_printed = not debug_first_batch
 
         log.info(
@@ -930,15 +936,22 @@ class CHBMITDatasetHDF5(Dataset):
             pos_idx = [i for i, e in enumerate(self.index) if e.label == 1]
             neg_idx = [i for i, e in enumerate(self.index) if e.label == 0]
             n_pos, n_neg = len(pos_idx), len(neg_idx)
+            target_neg = n_pos * self.neg_ratio        # desired # of negatives
             rng_us = np.random.default_rng(undersample_seed)
-            if n_neg > n_pos:
-                neg_idx = rng_us.choice(neg_idx, n_pos, replace=False).tolist()
+            if n_neg > target_neg:
+                neg_idx = rng_us.choice(
+                    neg_idx, target_neg, replace=False).tolist()
+            # If n_neg <= target_neg: keep all available negatives (no-op)
             kept = sorted(pos_idx + neg_idx)
             self.index = [self.index[i] for i in kept]
+            after_pos = len(pos_idx)
+            after_neg = len(neg_idx)
+            actual_ratio = after_neg / max(after_pos, 1)
             log.info(
-                f"[{split}] Undersampling (1:1): "
+                f"[{split}] Undersampling (1:{self.neg_ratio}): "
                 f"before pos={n_pos} neg={n_neg} | "
-                f"after  pos={len(pos_idx)} neg={len(neg_idx)} | "
+                f"after  pos={after_pos} neg={after_neg} "
+                f"(actual ratio 1:{actual_ratio:.2f}) | "
                 f"total={len(self.index)}"
             )
 
@@ -1153,6 +1166,7 @@ def load_dataset_chbmit_hdf5(
         min_channels=None,
         undersample_train=True,  # 50/50 neg undersampling on train (paper §5)
         undersample_dev=False,   # 50/50 neg undersampling on dev (experimental; default OFF)
+        neg_ratio=1,             # negatives per positive when undersampling train (default 1:1)
         seizure_stride=None,     # dense stride (seconds) for seizure oversampling; None=disabled
         inspect_first_file=True,
 ):
@@ -1180,9 +1194,12 @@ def load_dataset_chbmit_hdf5(
         val_ratio:         fraction of patients in dev split
         seed:              RNG seed for patient-level split
         min_channels:      skip recordings with fewer than this many channels
-        undersample_train: if True, downsample negatives to 50/50 on train (paper §5)
-        undersample_dev:   if True, apply the same 1:1 undersampling to dev set.
+        undersample_train: if True, downsample negatives on train set (paper §5)
+        undersample_dev:   if True, apply the same undersampling to dev set.
                            Default False (original distribution). test is never undersampled.
+        neg_ratio:         negatives per positive kept when undersampling train
+                           (default 1 → 1:1).  E.g. neg_ratio=3 → 1:3.
+                           dev/test are never affected by this parameter.
         seizure_stride:    dense stride in seconds used ONLY for the train set to
                            oversample positive (seizure) clips around each seizure
                            interval.  None (default) = no oversampling.
@@ -1347,10 +1364,15 @@ def load_dataset_chbmit_hdf5(
         else:
             do_undersample = False   # test: always original distribution
 
+        # neg_ratio applies to train only; dev/test always use ratio=1
+        # (though undersampling is off for them by default anyway)
+        split_neg_ratio = neg_ratio if split == "train" else 1
+
         ds = CHBMITDatasetHDF5(
             hdf5_paths=split_files[split],
             split=split,
             undersample=do_undersample,
+            neg_ratio=split_neg_ratio,
             seizure_stride_samples=split_seizure_stride,
             debug_first_batch=(split == "train"),
             **common_kwargs,

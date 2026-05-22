@@ -97,7 +97,13 @@ def get_args():
     parser.add_argument("--top_k", type=int, default=3,
                         help="Top-k neighbours for cross-correlation graph (paper: τ=3).")
     parser.add_argument("--no_undersample", action="store_true", default=False,
-                        help="Disable 50/50 negative undersampling on train set.")
+                        help="Disable negative undersampling on train set entirely.")
+    parser.add_argument("--neg_ratio", type=int, default=1,
+                        help="Negatives kept per positive during train undersampling "
+                             "(default 1 → positive:negative = 1:1). "
+                             "E.g. --neg_ratio 3 gives 1:3. "
+                             "Ignored when --no_undersample is set. "
+                             "dev/test are never affected.")
     parser.add_argument("--undersample_dev", action="store_true", default=False,
                         help="Apply 1:1 negative undersampling to the dev set as well. "
                              "Default OFF (original distribution). "
@@ -412,6 +418,7 @@ def main():
             seed=args.rand_seed,
             undersample_train=(not args.no_undersample),
             undersample_dev=args.undersample_dev,
+            neg_ratio=args.neg_ratio,
             seizure_stride=args.seizure_stride,
             inspect_first_file=True,
         )
@@ -451,9 +458,16 @@ def main():
     sz_stride_str = (
         f"seizure_stride={args.seizure_stride}s" if args.seizure_stride else "no oversampling"
     )
+    undersample_str = (
+        f"no undersampling" if args.no_undersample
+        else f"1:{args.neg_ratio} undersampling"
+    )
+    actual_ratio = n_neg / max(n_pos, 1)
     log.info(
-        f"Train set final  ({sz_stride_str}, 1:1 undersample={not args.no_undersample}): "
-        f"total={len(targets)} | pos={n_pos} ({100*n_pos/max(len(targets),1):.1f}%) | neg={n_neg}"
+        f"Train set final  ({sz_stride_str}, {undersample_str}): "
+        f"total={len(targets)} | pos={n_pos} | neg={n_neg} "
+        f"(ratio 1:{actual_ratio:.2f}) | "
+        f"pos_frac={100*n_pos/max(len(targets),1):.1f}%"
     )
 
     # ── Dev set stats ─────────────────────────────────────────────────────
