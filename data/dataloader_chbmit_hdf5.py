@@ -1364,9 +1364,16 @@ def load_dataset_chbmit_hdf5(
         else:
             do_undersample = False   # test: always original distribution
 
-        # neg_ratio applies to train only; dev/test always use ratio=1
-        # (though undersampling is off for them by default anyway)
-        split_neg_ratio = neg_ratio if split == "train" else 1
+        # neg_ratio:
+        #   train → always apply neg_ratio
+        #   dev   → apply neg_ratio only when undersample_dev is True
+        #   test  → always 1 (never undersampled)
+        if split == "train":
+            split_neg_ratio = neg_ratio
+        elif split == "dev" and undersample_dev:
+            split_neg_ratio = neg_ratio
+        else:
+            split_neg_ratio = 1
 
         ds = CHBMITDatasetHDF5(
             hdf5_paths=split_files[split],

@@ -348,11 +348,18 @@ def train(model, dataloaders, args, device, save_dir):
 
         # ── evaluation ──────────────────────────────────────────────────
         if epoch % args.eval_every == 0:
+            # Train evaluation (threshold=0.5; helps diagnose under-/over-fitting)
+            train_scores = evaluate(model, dataloaders["train"], device, args,
+                                    threshold=0.5)
+            train_str = ", ".join(f"{k}={v:.4f}" for k, v in train_scores.items())
+            log.info(f"[TRAIN] threshold=0.50  {train_str}")
+
+            # Dev evaluation (controls checkpoint saving and early stopping)
             scores = evaluate(model, dataloaders["dev"], device, args,
                               debug_shapes=(epoch == 1))
             metric_val = scores[args.metric_name]
             scores_str = ", ".join(f"{k}={v:.4f}" for k, v in scores.items())
-            log.info(f"[Dev] {scores_str}")
+            log.info(f"[DEV]   threshold=0.50  {scores_str}")
 
             saver.save(epoch, model, optimizer, metric_val)
 
@@ -475,7 +482,14 @@ def main():
     dev_tgt = dev_ds.targets()
     dev_pos = int(sum(dev_tgt))
     dev_neg = len(dev_tgt) - dev_pos
-    dev_dist_str = "undersampled 1:1" if args.undersample_dev else "original distribution"
+    if args.undersample_dev:
+        dev_actual_ratio = dev_neg / max(dev_pos, 1)
+        dev_dist_str = (
+            f"undersampled 1:{args.neg_ratio} "
+            f"(actual 1:{dev_actual_ratio:.2f})"
+        )
+    else:
+        dev_dist_str = "original distribution"
     log.info(
         f"Dev  set ({dev_dist_str}): "
         f"total={len(dev_tgt)} | pos={dev_pos} ({100*dev_pos/max(len(dev_tgt),1):.2f}%) | neg={dev_neg}"
@@ -508,7 +522,8 @@ def main():
 
     # ── Threshold sweep on dev set ────────────────────────────────────────
     dev_sweep_note = (
-        "undersampled dev (1:1)" if args.undersample_dev else "original dev distribution"
+        f"undersampled dev (1:{args.neg_ratio})"
+        if args.undersample_dev else "original dev distribution"
     )
     log.info(f"Running threshold sweep on dev set [{dev_sweep_note}] …")
     dev_scores_05, dev_true, dev_prob = evaluate(
