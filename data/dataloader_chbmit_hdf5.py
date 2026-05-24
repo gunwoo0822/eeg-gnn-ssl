@@ -1295,10 +1295,18 @@ def load_dataset_chbmit_hdf5(
         "dev":   [f for p in val_pats   for f in patient_to_files[p]],
         "test":  [f for p in test_pats  for f in patient_to_files[p]],
     }
+    train_pats_sorted = sorted(train_pats)
+    val_pats_sorted   = sorted(val_pats)
+    test_pats_sorted  = sorted(test_pats)
+
     log.info(
-        f"Patient split: {len(train_pats)} train ({len(split_files['train'])} files) | "
+        f"Patient split (seed={seed}): "
+        f"{len(train_pats)} train ({len(split_files['train'])} files) | "
         f"{len(val_pats)} dev | {len(test_pats)} test"
     )
+    log.info(f"  Train patients : {', '.join(train_pats_sorted)}")
+    log.info(f"  Dev   patients : {', '.join(val_pats_sorted)}")
+    log.info(f"  Test  patients : {', '.join(test_pats_sorted)}")
 
     # Build training index first (needed for scaler)
     log.info("Building training index (probe only – no EEG in RAM)…")
