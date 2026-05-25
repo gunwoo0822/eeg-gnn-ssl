@@ -131,6 +131,14 @@ def get_args():
         default=False,
         action='store_true',
         help='Whether the input data is Fourier transformed EEG signal or raw EEG.')
+    parser.add_argument(
+        '--no_standardize',
+        default=False,
+        action='store_true',
+        help='(detection only) Disable z-normalization. '
+             'Use when pre-computed mean/std files do not match the current dataset '
+             '(e.g. TUSZ 2.0.3 with new markers). '
+             'Has no effect on classification or SSL tasks.')
 
     # Training/test args
     parser.add_argument('--train_batch_size',

@@ -59,7 +59,7 @@ def main(args):
             test_batch_size=args.test_batch_size,
             time_step_size=args.time_step_size,
             max_seq_len=args.max_seq_len,
-            standardize=True,
+            standardize=(not args.no_standardize),
             num_workers=args.num_workers,
             augmentation=args.data_augment,
             adj_mat_dir='./data/electrode_graph/adj_mx_3d.pkl',
