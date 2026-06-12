@@ -127,19 +127,23 @@ class CheckpointSaver:
         if self.log is not None:
             self.log.info(message)
 
-    def save(self, epoch, model, optimizer, metric_val):
+    def save(self, epoch, model, optimizer, metric_val, extra=None):
         """Save model parameters to disk.
         Args:
             epoch (int): Current epoch.
             model (torch.nn.DataParallel): Model to save.
             optimizer: optimizer
             metric_val (float): Determines whether checkpoint is best so far.
+            extra (dict, optional): Additional key/value pairs to store in the
+                checkpoint dict (e.g. {'best_threshold': 0.37}).
         """
         ckpt_dict = {
             'epoch': epoch,
             'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict()
         }
+        if extra:
+            ckpt_dict.update(extra)
 
         checkpoint_path = os.path.join(self.save_dir, 'last.pth.tar')
         torch.save(ckpt_dict, checkpoint_path)

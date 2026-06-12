@@ -146,9 +146,14 @@ def get_args():
     parser.add_argument("--patience",         type=int,   default=5,
                         help="Early-stopping patience in epochs (paper: 5).")
     parser.add_argument("--metric_name",
-                        choices=["auroc", "F1", "acc", "loss"],
+                        type=str.lower,
+                        choices=["auroc", "f1", "acc", "loss", "auprc"],
                         default="auroc",
-                        help="Metric used to select best checkpoint.")
+                        help="Metric used to select best checkpoint (case-insensitive: "
+                             "'F1'/'f1', 'AUPRC'/'auprc', etc.). "
+                             "'f1' uses dev threshold-swept best F1, not fixed "
+                             "threshold=0.5 F1. 'loss' is minimised, all others "
+                             "are maximised.")
 
     args = parser.parse_args()
 
@@ -303,9 +308,8 @@ def train(model, dataloaders, args, device, save_dir):
         maximize_metric=args.maximize_metric,
         log=log)
 
-    prev_val_loss  = 1e10
-    patience_count = 0
-    first_debug    = True   # print shapes on the very first training batch
+    epochs_no_improve = 0
+    first_debug       = True   # print shapes on the very first training batch
 
     for epoch in range(1, args.num_epochs + 1):
         model.train()
@@ -355,22 +359,45 @@ def train(model, dataloaders, args, device, save_dir):
             log.info(f"[TRAIN] threshold=0.50  {train_str}")
 
             # Dev evaluation (controls checkpoint saving and early stopping)
-            scores = evaluate(model, dataloaders["dev"], device, args,
-                              debug_shapes=(epoch == 1))
-            metric_val = scores[args.metric_name]
+            scores, dev_true, dev_prob = evaluate(
+                model, dataloaders["dev"], device, args,
+                debug_shapes=(epoch == 1), return_probs=True)
             scores_str = ", ".join(f"{k}={v:.4f}" for k, v in scores.items())
             log.info(f"[DEV]   threshold=0.50  {scores_str}")
 
-            saver.save(epoch, model, optimizer, metric_val)
-
-            if scores["loss"] < prev_val_loss:
-                patience_count = 0
+            # Checkpoint metric: 'f1' uses dev threshold-swept best F1 (more
+            # stable under extreme class imbalance than fixed threshold=0.5 F1).
+            if args.metric_name == "f1":
+                epoch_best_thresh, epoch_best_f1_scores, _ = sweep_threshold(dev_true, dev_prob)
+                metric_val = epoch_best_f1_scores["F1"]
+                log.info(
+                    f"[DEV]   threshold-swept best F1={metric_val:.4f} "
+                    f"@ threshold={epoch_best_thresh:.2f}"
+                )
             else:
-                patience_count += 1
-            prev_val_loss = scores["loss"]
+                scores_lower = {k.lower(): v for k, v in scores.items()}
+                metric_val = scores_lower[args.metric_name]
+                epoch_best_thresh = 0.5
 
-            if patience_count >= args.patience:
-                log.info("Early stopping triggered.")
+            # ── checkpoint saving + early stopping ───────────────────────
+            improved = saver.is_best(metric_val)
+            saver.save(epoch, model, optimizer, metric_val, extra={
+                "best_threshold": epoch_best_thresh,
+                "metric_name": args.metric_name,
+                "metric_val": metric_val,
+            })
+
+            if improved:
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+
+            if epochs_no_improve >= args.patience:
+                log.info(
+                    f"Early stopping at epoch {epoch} "
+                    f"(no improvement in dev {args.metric_name} "
+                    f"for {args.patience} eval rounds)."
+                )
                 break
 
         scheduler.step()
@@ -519,6 +546,17 @@ def main():
             model = utils.load_model_checkpoint(best_path, model)
             model = model.to(device)
             log.info("Loaded best checkpoint for final evaluation.")
+            try:
+                best_ckpt = torch.load(best_path, map_location=device)
+                if "best_threshold" in best_ckpt:
+                    log.info(
+                        f"Best checkpoint: epoch={best_ckpt.get('epoch')}  "
+                        f"metric_name={best_ckpt.get('metric_name', args.metric_name)}  "
+                        f"metric_val={best_ckpt.get('metric_val', float('nan')):.4f}  "
+                        f"best_threshold={best_ckpt['best_threshold']:.4f}"
+                    )
+            except Exception as e:
+                log.warning(f"Could not read checkpoint metadata: {e}")
 
     # ── Threshold sweep on dev set ────────────────────────────────────────
     dev_sweep_note = (
