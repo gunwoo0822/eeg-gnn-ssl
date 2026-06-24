@@ -862,7 +862,8 @@ class CHBMITDatasetHDF5(Dataset):
             undersample_seed=42,
             neg_ratio=1,
             seizure_stride_samples=None,
-            debug_first_batch=True):
+            debug_first_batch=True,
+            return_raw=False):
         """
         Do not call directly – use load_dataset_chbmit_hdf5() instead.
 
@@ -899,6 +900,7 @@ class CHBMITDatasetHDF5(Dataset):
         self.filter_type   = filter_type
         self.split         = split
         self.neg_ratio     = max(1, int(neg_ratio))   # positive:negative = 1:neg_ratio
+        self.return_raw    = return_raw                # student (EEGNet) raw-signal mode
         self._debug_printed = not debug_first_batch
 
         log.info(
@@ -1137,7 +1139,21 @@ class CHBMITDatasetHDF5(Dataset):
                 f"\n  lazy                   : True (h5py slicing per item)"
             )
 
-        return x, y, seq_len, supports, adj_mat, f"chbmit_hdf5_{entry.patient}_{idx}"
+        clip_id = f"chbmit_hdf5_{entry.patient}_{idx}"
+
+        if self.return_raw:
+            # Raw time-domain clip for the EEGNet student.
+            # eeg_clip: (seq_len, C, step_samples) → (C, seq_len*step_samples) = (C, T)
+            #   e.g. (6, 18, 200) → (18, 1200), temporal order preserved.
+            raw_ct = (
+                eeg_clip.transpose(1, 0, 2)
+                .reshape(self.num_nodes, -1)
+                .copy()
+            )
+            raw_t = torch.FloatTensor(raw_ct)               # (C, T)
+            return x, y, seq_len, supports, adj_mat, clip_id, raw_t
+
+        return x, y, seq_len, supports, adj_mat, clip_id
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1185,7 @@ def load_dataset_chbmit_hdf5(
         neg_ratio=1,             # negatives per positive when undersampling train (default 1:1)
         seizure_stride=None,     # dense stride (seconds) for seizure oversampling; None=disabled
         inspect_first_file=True,
+        return_raw=False,        # student (EEGNet) mode: also return raw (C,T) clip per item
 ):
     """
     Build train / dev / test DataLoaders from a directory of CHB-MIT HDF5 files.
@@ -1353,6 +1370,7 @@ def load_dataset_chbmit_hdf5(
         standardize=standardize, scaler=scaler,
         graph_type=graph_type, top_k=top_k, filter_type=filter_type,
         seizure_map=seizure_map,
+        return_raw=return_raw,
     )
 
     dataloaders, datasets = {}, {}
