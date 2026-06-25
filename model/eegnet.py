@@ -63,6 +63,15 @@ class EEGNetStudent(nn.Module):
         self.flatten = nn.Flatten()
         self.classify = nn.LazyLinear(n_outputs)
 
+        # Materialise the LazyLinear immediately via a dummy forward, so that
+        # parameter counting, optimizer construction, and checkpoint load/save
+        # all work BEFORE the first real batch. eval() avoids touching BN
+        # running stats; no_grad() avoids building a graph.
+        self.eval()
+        with torch.no_grad():
+            self.forward(torch.zeros(1, n_chans, n_times))
+        self.train()
+
     def forward(self, x, seq_lengths=None, supports=None):
         """x: (B, C, T) raw signal. seq_lengths/supports ignored (teacher-only)."""
         if x.dim() == 3:                       # (B, C, T) → (B, 1, C, T)
