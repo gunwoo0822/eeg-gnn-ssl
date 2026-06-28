@@ -24,6 +24,7 @@ Run (in the teacher's venv, on Vessl):
 import sys
 import json
 import time
+import logging
 import argparse
 from types import SimpleNamespace
 from pathlib import Path
@@ -124,22 +125,30 @@ def build_teacher(json_path, ckpt_path, num_nodes, device):
 
 def main():
     args = get_args()
+    # Show dataloader progress (otherwise setup looks silently hung).
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.StreamHandler(sys.stdout)])
     device = "cuda" if torch.cuda.is_available() else "cpu"
     utils.seed_torch(args.rand_seed)
-    print(f"Device: {device}  | batch_size={args.batch_size}  n_iters={args.n_iters}\n")
+    print(f"Device: {device}  | batch_size={args.batch_size}  n_iters={args.n_iters}\n", flush=True)
 
     # ── One real batch (test loader) ────────────────────────────────────────
+    # standardize=False → skip the slow streaming-scaler pass; it only rescales
+    # input values and does NOT affect params/latency/FLOPs being measured here.
+    print("Building dataloader (reading dataset headers; ~1-3 min)…", flush=True)
     dataloaders, datasets, _ = load_dataset_chbmit_hdf5(
         hdf5_dir=args.hdf5_dir, summary_dir=args.summary_dir,
         train_batch_size=args.batch_size, test_batch_size=args.batch_size,
         win_len=args.win_len, time_step_size=args.time_step_size,
         orig_fs=args.orig_fs, fs=args.fs, fft_features=args.fft_features,
         graph_type=args.graph_type, top_k=args.top_k, filter_type=args.filter_type,
-        standardize=True, num_workers=0,
+        standardize=False, num_workers=0,
         train_ratio=args.train_ratio, val_ratio=args.val_ratio, seed=args.rand_seed,
         undersample_train=True, neg_ratio=args.neg_ratio,
         seizure_stride=args.seizure_stride, inspect_first_file=True, return_raw=True,
     )
+    print("Fetching one test batch…", flush=True)
     batch = next(iter(dataloaders["test"]))
     x_fft, _, seq_len, supports, _, _, raw = batch
     num_nodes = datasets["test"].num_nodes
