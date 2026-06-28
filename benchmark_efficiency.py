@@ -194,26 +194,32 @@ def main():
     t_tot, t_mb, t_lat, t_fl = report("Teacher (Corr-DCRNN)", teacher, teacher_fwd,
                                       (x_d, seq_d, sup_d))
 
-    # ── Optional CPU latency (edge-relevant) ─────────────────────────────────
-    if device == "cuda":
-        print("\nCPU latency (edge-relevant)…")
-        student_c = student.to("cpu"); teacher_c = teacher.to("cpu")
-        raw_c = raw.to("cpu"); x_c = x_fft.to("cpu")
-        seq_c = seq_len.view(-1).to("cpu"); sup_c = [s.to("cpu") for s in supports]
-        s_lat_cpu = bench_latency(lambda: student_c(raw_c),
-                                  max(args.n_iters // 4, 20), args.warmup, "cpu") / bs
-        t_lat_cpu = bench_latency(lambda: teacher_c(x_c, seq_c, sup_c),
-                                  max(args.n_iters // 4, 20), args.warmup, "cpu") / bs
-        print(f"  Student CPU latency/clip: {s_lat_cpu:.3f} ms  ({1000.0/s_lat_cpu:.1f} clips/s)")
-        print(f"  Teacher CPU latency/clip: {t_lat_cpu:.3f} ms  ({1000.0/t_lat_cpu:.1f} clips/s)")
-
-    # ── Ratios ────────────────────────────────────────────────────────────────
+    # ── Ratios (print before optional CPU section so they always show) ──────
     print("\n== Student vs Teacher (efficiency gain) ==")
     print(f"  params : {t_tot/max(s_tot,1):.1f}× fewer")
     print(f"  size   : {t_mb/max(s_mb,1e-9):.1f}× smaller")
     print(f"  latency: {t_lat/max(s_lat,1e-9):.1f}× faster ({device})")
     if s_fl and t_fl:
         print(f"  FLOPs  : {t_fl/max(s_fl,1):.1f}× fewer")
+
+    # ── Optional CPU latency (edge-relevant) ─────────────────────────────────
+    if device == "cuda":
+        print("\nCPU latency (edge-relevant)…")
+        try:
+            student_c = student.to("cpu")
+            teacher_c = teacher.to("cpu")
+            teacher_c._device = "cpu"   # DCRNN caches its device internally
+            raw_c = raw.to("cpu"); x_c = x_fft.to("cpu")
+            seq_c = seq_len.view(-1).to("cpu"); sup_c = [s.to("cpu") for s in supports]
+            s_lat_cpu = bench_latency(lambda: student_c(raw_c),
+                                      max(args.n_iters // 4, 20), args.warmup, "cpu") / bs
+            t_lat_cpu = bench_latency(lambda: teacher_c(x_c, seq_c, sup_c),
+                                      max(args.n_iters // 4, 20), args.warmup, "cpu") / bs
+            print(f"  Student CPU latency/clip: {s_lat_cpu:.3f} ms  ({1000.0/s_lat_cpu:.1f} clips/s)")
+            print(f"  Teacher CPU latency/clip: {t_lat_cpu:.3f} ms  ({1000.0/t_lat_cpu:.1f} clips/s)")
+            print(f"  → Student is {t_lat_cpu/max(s_lat_cpu,1e-9):.1f}× faster on CPU")
+        except Exception as e:
+            print(f"  (CPU benchmark skipped: {e})")
 
 
 if __name__ == "__main__":
